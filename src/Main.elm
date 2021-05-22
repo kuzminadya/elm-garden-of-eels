@@ -2,30 +2,42 @@ module Main exposing (main)
 
 import Animator exposing (Timeline)
 import Browser
+import Browser.Dom
 import Browser.Events
 import Const
-import Coordinates exposing (World)
+import Coordinates
 import Duration exposing (Duration)
 import Eel exposing (Eel)
 import Geometry.Svg as Svg
 import Html exposing (Html)
 import Html.Attributes
-import Json.Decode as Decode
-import Length exposing (Meters)
+import Html.Events
+import Html.Events.Extra.Mouse as Mouse
+import Html.Events.Extra.Touch as Touch
+import Length
+import Pixels exposing (Pixels)
 import Plankter exposing (Plankter, PlankterKind(..))
-import Point2d exposing (Point2d)
-import Quantity
+import Point2d
+import Quantity exposing (Quantity)
 import Random exposing (Seed)
 import Speed exposing (Speed)
 import Splash exposing (Splash)
 import Svg
 import Svg.Attributes
+import Task
 import Time
 import Vector2d
 
 
+type State
+    = Start
+    | Playing
+    | EndGame
+
+
 type alias Model =
     { current : Timeline Speed
+    , state : State
     , time : Time.Posix
     , score : Int
     , lives : Int
@@ -34,20 +46,24 @@ type alias Model =
     , seed : Seed
     , spawner : Timeline Float
     , eels : List Eel
+    , width : Quantity Float Pixels
+    , height : Quantity Float Pixels
     }
 
 
 type Msg
     = MouseDown Float Float
     | Tick Float
+    | OnStartGameClicked
+    | Resize Float Float
 
 
-burrows : List (Point2d Meters World)
-burrows =
-    [ Point2d.meters -1.15 0.13
-    , Point2d.meters -0.36 -0.12
-    , Point2d.meters 0.23 -0.68
-    , Point2d.meters 0.72 -0.43
+initEels : List Eel
+initEels =
+    [ Eel.init "#fff" "#202020" (Length.millimeters 36) (Length.meters 0.6) (Point2d.meters -1.15 0.13)
+    , Eel.init "#000" "#6f6f6f" (Length.millimeters 36) (Length.meters 0.6) (Point2d.meters -0.36 -0.12)
+    , Eel.init "#fff" "#494949" (Length.millimeters 36) (Length.meters 0.6) (Point2d.meters 0.23 -0.68)
+    , Eel.init "#000" "#d9d9d9" (Length.millimeters 36) (Length.meters 0.6) (Point2d.meters 0.72 -0.43)
     ]
 
 
@@ -55,25 +71,13 @@ main : Program () Model Msg
 main =
     Browser.element
         { init =
-            \_ ->
-                ( { eels =
-                        burrows
-                            |> List.map
-                                (\burrow ->
-                                    Eel.init
-                                        (Length.meters 0.6)
-                                        burrow
-                                )
-                  , plankters = []
-                  , splashes = []
-                  , current = Animator.init Const.midCurrent
-                  , seed = Random.initialSeed 1
-                  , spawner = Animator.init 0
-                  , time = Time.millisToPosix 0
-                  , lives = 5
-                  , score = 0
-                  }
-                , Cmd.none
+            always
+                ( initModel
+                , Task.perform
+                    (\{ viewport } ->
+                        Resize viewport.width viewport.height
+                    )
+                    Browser.Dom.getViewport
                 )
         , view = view
         , update = update
@@ -81,12 +85,47 @@ main =
         }
 
 
+initModel : Model
+initModel =
+    { state = Start
+    , eels = initEels
+    , plankters = []
+    , splashes = []
+    , current = Animator.init Const.midCurrent
+    , seed = Random.initialSeed 1
+    , spawner = Animator.init 0
+    , time = Time.millisToPosix 0
+    , lives = 5
+    , score = 0
+    , width = Quantity.zero
+    , height = Quantity.zero
+    }
+
+
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        MouseDown x y ->
+        Resize width height ->
             ( { model
-                | splashes = Splash.init (Coordinates.screenToWorld (Point2d.pixels x y)) :: model.splashes
+                | width = Pixels.pixels width
+                , height = Pixels.pixels height
+              }
+            , Cmd.none
+            )
+
+        MouseDown x y ->
+            let
+                ratio =
+                    1 / fit (Pixels.inPixels model.width) (Pixels.inPixels model.height) 960 640
+
+                newX =
+                    x * ratio - (Pixels.inPixels model.width * ratio - 960) / 2
+
+                newY =
+                    y * ratio - (Pixels.inPixels model.height * ratio - 640) / 2
+            in
+            ( { model
+                | splashes = Splash.init (Coordinates.screenToWorld (Point2d.pixels newX newY)) :: model.splashes
               }
             , Cmd.none
             )
@@ -103,13 +142,76 @@ update msg model =
                 | time = time
                 , current = Animator.updateTimeline time model.current
               }
+                |> gameLoop delta
+            , Cmd.none
+            )
+
+        OnStartGameClicked ->
+            ( { initModel
+                | state = Playing
+
+                -- keep width and height too
+                , width = model.width
+                , height = model.height
+              }
+            , Cmd.none
+            )
+
+
+gameLoop : Duration -> Model -> Model
+gameLoop delta model =
+    case model.state of
+        Playing ->
+            model
                 |> spawnPlankters
                 |> animatePlankters delta
                 |> animateEels
                 |> animateSplashes
                 |> eatPlankters
-            , Cmd.none
-            )
+                |> checkEndGame
+
+        EndGame ->
+            model
+                |> animateEndGame
+
+        Start ->
+            model
+
+
+checkEndGame : Model -> Model
+checkEndGame model =
+    let
+        hideEel eel =
+            { eel
+                | timeline =
+                    Animator.queue [ Animator.event (Animator.seconds 2) Eel.Hidden ] eel.timeline
+            }
+    in
+    if model.lives <= 0 then
+        { model
+            | state = EndGame
+            , eels = List.map hideEel model.eels
+        }
+
+    else
+        model
+
+
+animateEndGame : Model -> Model
+animateEndGame model =
+    let
+        eelHidden eel =
+            (Animator.arrived eel.timeline == Eel.Hidden)
+                && (Animator.current eel.timeline == Eel.Hidden)
+
+        updateHidingEel eel =
+            { eel | timeline = Animator.updateTimeline model.time eel.timeline }
+    in
+    if List.all eelHidden model.eels then
+        { model | state = Start }
+
+    else
+        { model | eels = List.map updateHidingEel model.eels }
 
 
 getCurrent : Timeline Speed -> Speed
@@ -377,21 +479,31 @@ subscriptions : Model -> Sub Msg
 subscriptions _ =
     Sub.batch
         [ Browser.Events.onAnimationFrameDelta Tick
-        , Browser.Events.onMouseDown
-            (Decode.map2 MouseDown
-                (Decode.field "pageX" Decode.float)
-                (Decode.field "pageY" Decode.float)
-            )
+        , Browser.Events.onResize (\width height -> Resize (toFloat width) (toFloat height))
         ]
 
 
-view : Model -> Html a
-view { current, eels, splashes, plankters, lives, score } =
+fit : Float -> Float -> Float -> Float -> Float
+fit w1 h1 w2 h2 =
+    if w1 * h2 < w2 * h1 then
+        w1 / w2
+
+    else
+        h1 / h2
+
+
+view : Model -> Html Msg
+view { state, current, eels, splashes, plankters, lives, score, width, height } =
     Html.div
-        [ Html.Attributes.style "position" "relative"
+        [ Html.Attributes.style "transform" ("scale(" ++ String.fromFloat (fit (Pixels.inPixels width) (Pixels.inPixels height) 960 640) ++ ")")
+        , Html.Attributes.style "left" "50%"
+        , Html.Attributes.style "top" "50%"
+        , Html.Attributes.style "margin-left" (String.fromFloat (960 / -2) ++ "px")
+        , Html.Attributes.style "margin-top" (String.fromFloat (640 / -2) ++ "px")
+        , Html.Attributes.style "position" "absolute"
         , Html.Attributes.style "width" "960px"
         , Html.Attributes.style "height" "640px"
-        , Html.Attributes.style "background" "url(img/eels-bg.svg)"
+        , Html.Attributes.style "background" "url(img/background.svg)"
         , Html.Attributes.style "-webkit-touch-callout" "none"
         , Html.Attributes.style "-webkit-user-select" "none"
         , Html.Attributes.style "-khtml-user-select" "none"
@@ -399,20 +511,78 @@ view { current, eels, splashes, plankters, lives, score } =
         , Html.Attributes.style "-ms-user-select" "none"
         , Html.Attributes.style "user-select" "none"
         ]
-        [ Coordinates.view
-            (List.concat
-                [ List.map Plankter.view plankters
-                , List.map (Eel.view (getCurrent current)) eels
-                , List.map Splash.view splashes
-                ]
-                ++ [ Svg.placeIn Coordinates.topLeftFrame
-                        (Svg.text_
-                            [ Html.Attributes.style "font" "24px/1 sans-serif"
-                            , Svg.Attributes.x "20"
-                            , Svg.Attributes.y "40"
+        [ case state of
+            Start ->
+                Html.div
+                    [ Html.Attributes.style "background-image" "url(img/title.svg)"
+                    , Html.Attributes.style "background-repeat" "no-repeat"
+                    , Html.Attributes.style "background-position" "left top"
+                    , Html.Attributes.style "width" "960px"
+                    , Html.Attributes.style "height" "640px"
+                    , Html.Attributes.style "position" "absolute"
+                    , Html.Attributes.style "left" "0"
+                    , Html.Attributes.style "top" "0"
+                    , Html.Attributes.style "cursor" "pointer"
+                    , Html.Events.onClick OnStartGameClicked
+                    ]
+                    [ Coordinates.view [ livesAndScore 0 score ] ]
+
+            Playing ->
+                Html.div
+                    [ Html.Attributes.style "width" "960px"
+                    , Html.Attributes.style "height" "640px"
+                    , Html.Attributes.style "position" "relative"
+                    , Touch.onStart touchMsg
+                    , Mouse.onDown (\{ clientPos } -> MouseDown (Tuple.first clientPos) (Tuple.second clientPos))
+                    ]
+                    [ Coordinates.view
+                        (List.concat
+                            [ List.map Plankter.view plankters
+                            , List.map (Eel.view (getCurrent current)) eels
+                            , List.map Splash.view splashes
                             ]
-                            [ Svg.text ("Lives: " ++ String.fromInt lives ++ ", score: " ++ String.fromInt score) ]
+                            ++ [ livesAndScore lives score ]
                         )
-                   ]
-            )
+                    ]
+
+            EndGame ->
+                Coordinates.view
+                    (List.concat
+                        [ List.map (Eel.view (getCurrent current)) eels
+                        , [ livesAndScore 0 score ]
+                        ]
+                    )
+        , Html.node "style" [] [ Html.text """
+            @font-face {
+                font-family: EelsFontNum;
+                src: url(img/EelsFontNum-Regular.woff2);
+            }
+        """ ]
         ]
+
+
+touchMsg : Touch.Event -> Msg
+touchMsg touchEvent =
+    List.head touchEvent.changedTouches
+        |> Maybe.map (\{ clientPos } -> MouseDown (Tuple.first clientPos) (Tuple.second clientPos))
+        |> Maybe.withDefault (MouseDown 0 0)
+
+
+livesAndScore : Int -> Int -> Html Msg
+livesAndScore lives score =
+    Svg.placeIn Coordinates.topLeftFrame
+        (Svg.text_
+            [ Html.Attributes.style "font" "130px/1 EelsFontNum"
+            , Svg.Attributes.x "20"
+            , Svg.Attributes.y "600"
+            ]
+            [ if lives > 0 then
+                Svg.text (String.repeat lives "l" ++ " " ++ String.fromInt score)
+
+              else if score > 0 then
+                Svg.text (String.fromInt score)
+
+              else
+                Svg.text ""
+            ]
+        )
